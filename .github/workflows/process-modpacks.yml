@@ -1,6 +1,8 @@
 name: Process Modpack and Update Metadata
 
 on:
+  release:
+    types: [published]
   pull_request:
     types: [opened, synchronize, reopened]
     paths:
@@ -24,7 +26,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.head.ref || github.ref }}
+          ref: ${{ github.event.pull_request.head.ref || (github.event_name == 'release' && 'main') || github.ref }}
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -38,6 +40,7 @@ jobs:
           PYTHONUTF8: "1"
           GITHUB_REPOSITORY: ${{ github.repository }}
           GITHUB_REF_NAME: ${{ github.event.pull_request.base.ref || github.ref_name || 'main' }}
+          RELEASE_ASSETS_JSON: ${{ toJson(github.event.release.assets) }}
         run: |
           if [ -f ".github/workflows/process_modpacks.py" ]; then
             python .github/workflows/process_modpacks.py
@@ -45,36 +48,33 @@ jobs:
             python scripts/process_modpacks.py
           else
             python - << 'EOF'
-          import os, sys, shutil, hashlib, zipfile
+          import os, sys, json, shutil, hashlib, zipfile, urllib.request
           from pathlib import Path
 
-          def compute_sha256(path):
-              h = hashlib.sha256()
-              with open(path, "rb") as f:
+          def compute_stream_sha256(url):
+              hasher = hashlib.sha256()
+              req = urllib.request.Request(url, headers={"User-Agent": "RichAutoUpdater-Processor"})
+              with urllib.request.urlopen(req) as resp:
+                  while chunk := resp.read(65536):
+                      hasher.update(chunk)
+              return hasher.hexdigest().lower()
+
+          def compute_sha256(file_path):
+              hasher = hashlib.sha256()
+              with open(file_path, "rb") as f:
                   while chunk := f.read(65536):
-                      h.update(chunk)
-              return h.hexdigest().lower()
+                      hasher.update(chunk)
+              return hasher.hexdigest().lower()
 
-          def zip_dir(src, dst):
-              with zipfile.ZipFile(dst, "w", zipfile.ZIP_DEFLATED) as z:
-                  for root, _, files in os.walk(src):
+          def zip_directory(dir_path, zip_path):
+              with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
+                  for root, _, files in os.walk(dir_path):
                       for file in files:
-                          fp = os.path.join(root, file)
-                          z.write(fp, os.path.relpath(fp, src))
+                          full_path = os.path.join(root, file)
+                          rel_path = os.path.relpath(full_path, dir_path)
+                          zipf.write(full_path, rel_path)
 
-          repo = os.environ.get("GITHUB_REPOSITORY", "TwelveNord-Swiffty/richautoupdater")
-          modpacks_dir = Path("modpacks")
           meta_file = Path("metadata.meta")
-          if not modpacks_dir.exists():
-              modpacks_dir.mkdir(parents=True, exist_ok=True)
-
-          # Zip folders with '$'
-          for item in list(modpacks_dir.iterdir()):
-              if item.is_dir() and "$" in item.name:
-                  zip_dest = modpacks_dir / f"{item.name}.zip"
-                  zip_dir(item, zip_dest)
-                  shutil.rmtree(item)
-
           entries = []
           if meta_file.exists():
               with open(meta_file, "r", encoding="utf-8") as f:
@@ -85,47 +85,84 @@ jobs:
                       if len(p) >= 4:
                           entries.append({"name": p[0].strip(), "version": p[1].strip(), "url": p[2].strip(), "checksum": p[3].strip()})
 
+          release_assets = os.environ.get("RELEASE_ASSETS_JSON")
+          repo = os.environ.get("GITHUB_REPOSITORY", "TwelveNord-Swiffty/richautoupdater")
           processed = 0
-          for item in list(modpacks_dir.iterdir()):
-              if not item.is_file() or "$" not in item.name: continue
-              base = item.name[:-4] if item.name.lower().endswith(".zip") else item.name
-              parts = base.split("$", 1)
-              name, version = parts[0].strip(), parts[1].strip()
-              if not name or not version: continue
 
-              if not zipfile.is_zipfile(item):
-                  temp_z = modpacks_dir / f"{base}.zip"
-                  with zipfile.ZipFile(temp_z, "w", zipfile.ZIP_DEFLATED) as z:
-                      z.write(item, item.name)
-                  item.unlink()
-                  item = temp_z
+          if release_assets and release_assets.strip() not in ("[]", ""):
+              assets = json.loads(release_assets)
+              for asset in assets:
+                  name_full = asset.get("name", "")
+                  download_url = asset.get("browser_download_url", "")
+                  if "$" not in name_full or not name_full.lower().endswith(".zip"): continue
+                  base_name = name_full[:-4]
+                  parts = base_name.split("$", 1)
+                  pack_name, pack_version = parts[0].strip(), parts[1].strip()
+                  if not pack_name or not pack_version or not download_url: continue
 
-              checksum = compute_sha256(item)
-              target_name = f"{checksum}.zip"
-              target_path = modpacks_dir / target_name
+                  print(f"Release Asset: {name_full} -> computing SHA-256...")
+                  checksum = compute_stream_sha256(download_url)
+                  print(f"Checksum: {checksum}")
 
-              if target_path.exists() and target_path != item:
-                  item.unlink()
-              else:
-                  item.rename(target_path)
+                  found = False
+                  for e in entries:
+                      if e["name"].lower() == pack_name.lower() and e["version"].lower() == pack_version.lower():
+                          e["name"], e["version"], e["url"], e["checksum"] = pack_name, pack_version, download_url, checksum
+                          found = True
+                          break
+                  if not found:
+                      entries.append({"name": pack_name, "version": pack_version, "url": download_url, "checksum": checksum})
+                  processed += 1
+          else:
+              modpacks_dir = Path("modpacks")
+              if not modpacks_dir.exists():
+                  modpacks_dir.mkdir(parents=True, exist_ok=True)
 
-              dl_url = f"https://raw.githubusercontent.com/{repo}/main/modpacks/{target_name}"
+              for item in list(modpacks_dir.iterdir()):
+                  if item.is_dir() and "$" in item.name:
+                      zip_dest = modpacks_dir / f"{item.name}.zip"
+                      zip_directory(item, zip_dest)
+                      shutil.rmtree(item)
 
-              found = False
-              for e in entries:
-                  if e["name"].lower() == name.lower() and e["version"].lower() == version.lower():
-                      e["name"], e["version"], e["url"], e["checksum"] = name, version, dl_url, checksum
-                      found = True
-                      break
-              if not found:
-                  entries.append({"name": name, "version": version, "url": dl_url, "checksum": checksum})
-              processed += 1
+              for item in list(modpacks_dir.iterdir()):
+                  if not item.is_file() or "$" not in item.name: continue
+                  base = item.name[:-4] if item.name.lower().endswith(".zip") else item.name
+                  parts = base.split("$", 1)
+                  name, version = parts[0].strip(), parts[1].strip()
+                  if not name or not version: continue
+
+                  if not zipfile.is_zipfile(item):
+                      temp_z = modpacks_dir / f"{base}.zip"
+                      with zipfile.ZipFile(temp_z, "w", zipfile.ZIP_DEFLATED) as z:
+                          z.write(item, item.name)
+                      item.unlink()
+                      item = temp_z
+
+                  checksum = compute_sha256(item)
+                  target_name = f"{checksum}.zip"
+                  target_path = modpacks_dir / target_name
+
+                  if target_path.exists() and target_path != item:
+                      item.unlink()
+                  else:
+                      item.rename(target_path)
+
+                  dl_url = f"https://raw.githubusercontent.com/{repo}/main/modpacks/{target_name}"
+                  found = False
+                  for e in entries:
+                      if e["name"].lower() == name.lower() and e["version"].lower() == version.lower():
+                          e["name"], e["version"], e["url"], e["checksum"] = name, version, dl_url, checksum
+                          found = True
+                          break
+                  if not found:
+                      entries.append({"name": name, "version": version, "url": dl_url, "checksum": checksum})
+                  processed += 1
 
           if processed > 0:
               with open(meta_file, "w", encoding="utf-8", newline="\n") as f:
                   for e in entries:
                       f.write(f"{e['name']}${e['version']}${e['url']}${e['checksum']}\n")
-              print("Successfully processed modpacks and updated metadata.meta.")
+              print("Successfully updated metadata.meta.")
           EOF
           fi
 
@@ -133,11 +170,11 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add metadata.meta modpacks/
+          git add metadata.meta modpacks/ 2>/dev/null || git add metadata.meta
           if git diff --staged --quiet; then
             echo "No changes detected to commit."
           else
-            git commit -m "Auto-process modpack: update metadata and rename to checksum [skip ci]"
-            TARGET_BRANCH="${{ github.head_ref || github.ref_name || 'main' }}"
+            git commit -m "Auto-process modpack: update metadata [skip ci]"
+            TARGET_BRANCH="${{ github.head_ref || (github.event_name == 'release' && 'main') || github.ref_name || 'main' }}"
             git push origin HEAD:$TARGET_BRANCH
           fi
