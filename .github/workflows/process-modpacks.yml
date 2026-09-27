@@ -1,0 +1,143 @@
+name: Process Modpack and Update Metadata
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - 'modpacks/**'
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - 'modpacks/**'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  process-modpack:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.ref || github.ref }}
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Process modpacks and update metadata
+        env:
+          PYTHONUTF8: "1"
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_REF_NAME: ${{ github.event.pull_request.base.ref || github.ref_name || 'main' }}
+        run: |
+          if [ -f ".github/workflows/process_modpacks.py" ]; then
+            python .github/workflows/process_modpacks.py
+          elif [ -f "scripts/process_modpacks.py" ]; then
+            python scripts/process_modpacks.py
+          else
+            python - << 'EOF'
+          import os, sys, shutil, hashlib, zipfile
+          from pathlib import Path
+
+          def compute_sha256(path):
+              h = hashlib.sha256()
+              with open(path, "rb") as f:
+                  while chunk := f.read(65536):
+                      h.update(chunk)
+              return h.hexdigest().lower()
+
+          def zip_dir(src, dst):
+              with zipfile.ZipFile(dst, "w", zipfile.ZIP_DEFLATED) as z:
+                  for root, _, files in os.walk(src):
+                      for file in files:
+                          fp = os.path.join(root, file)
+                          z.write(fp, os.path.relpath(fp, src))
+
+          repo = os.environ.get("GITHUB_REPOSITORY", "TwelveNord-Swiffty/richautoupdater")
+          modpacks_dir = Path("modpacks")
+          meta_file = Path("metadata.meta")
+          if not modpacks_dir.exists():
+              modpacks_dir.mkdir(parents=True, exist_ok=True)
+
+          # Zip folders with '$'
+          for item in list(modpacks_dir.iterdir()):
+              if item.is_dir() and "$" in item.name:
+                  zip_dest = modpacks_dir / f"{item.name}.zip"
+                  zip_dir(item, zip_dest)
+                  shutil.rmtree(item)
+
+          entries = []
+          if meta_file.exists():
+              with open(meta_file, "r", encoding="utf-8") as f:
+                  for line in f:
+                      l = line.strip()
+                      if not l or l.startswith("#"): continue
+                      p = l.split("$")
+                      if len(p) >= 4:
+                          entries.append({"name": p[0].strip(), "version": p[1].strip(), "url": p[2].strip(), "checksum": p[3].strip()})
+
+          processed = 0
+          for item in list(modpacks_dir.iterdir()):
+              if not item.is_file() or "$" not in item.name: continue
+              base = item.name[:-4] if item.name.lower().endswith(".zip") else item.name
+              parts = base.split("$", 1)
+              name, version = parts[0].strip(), parts[1].strip()
+              if not name or not version: continue
+
+              if not zipfile.is_zipfile(item):
+                  temp_z = modpacks_dir / f"{base}.zip"
+                  with zipfile.ZipFile(temp_z, "w", zipfile.ZIP_DEFLATED) as z:
+                      z.write(item, item.name)
+                  item.unlink()
+                  item = temp_z
+
+              checksum = compute_sha256(item)
+              target_name = f"{checksum}.zip"
+              target_path = modpacks_dir / target_name
+
+              if target_path.exists() and target_path != item:
+                  item.unlink()
+              else:
+                  item.rename(target_path)
+
+              dl_url = f"https://raw.githubusercontent.com/{repo}/main/modpacks/{target_name}"
+
+              found = False
+              for e in entries:
+                  if e["name"].lower() == name.lower() and e["version"].lower() == version.lower():
+                      e["name"], e["version"], e["url"], e["checksum"] = name, version, dl_url, checksum
+                      found = True
+                      break
+              if not found:
+                  entries.append({"name": name, "version": version, "url": dl_url, "checksum": checksum})
+              processed += 1
+
+          if processed > 0:
+              with open(meta_file, "w", encoding="utf-8", newline="\n") as f:
+                  for e in entries:
+                      f.write(f"{e['name']}${e['version']}${e['url']}${e['checksum']}\n")
+              print("Successfully processed modpacks and updated metadata.meta.")
+          EOF
+          fi
+
+      - name: Commit and push changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add metadata.meta modpacks/
+          if git diff --staged --quiet; then
+            echo "No changes detected to commit."
+          else
+            git commit -m "Auto-process modpack: update metadata and rename to checksum [skip ci]"
+            TARGET_BRANCH="${{ github.head_ref || github.ref_name || 'main' }}"
+            git push origin HEAD:$TARGET_BRANCH
+          fi
